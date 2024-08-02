@@ -231,7 +231,7 @@ void run_demo(const char *path) {
 		printf("\t\t\t\t{ \"tick\": 0, \"type\": \"demosum\", \"value\": null },\n");
 
 	} else if (demo->v2sum_state == V2SUM_VALID) {
-		
+
 		struct demo_msg *msg = demo->msgs[demo->nmsgs - 1];
 		uint32_t sar_sum = msg->sar_data.checksum_v2.sar_sum;
 
@@ -262,9 +262,23 @@ void run_demo(const char *path) {
 int main(int argc, char **argv) {
 	_g_expected_maps = (const char **)config_read_newline_sep(EXPECTED_MAPS_FILE);
 	g_cmd_whitelist = config_read_newline_sep(CMD_WHITELIST_FILE);
-	g_sar_sum_whitelist = config_read_newline_sep(SAR_WHITELIST_FILE);
-	g_filesum_whitelist = config_read_var_whitelist(FILESUM_WHITELIST_FILE);
 	g_cvar_whitelist = config_read_var_whitelist(CVAR_WHITELIST_FILE);
+
+	// read filesum/sarsum paths from args if specified
+	if (argc >= 2) {
+		for (int i = 1; i < argc; i ++) {
+			if (strcmp(argv[i], "--sarsum-path") == 0) {
+				g_sar_sum_whitelist = config_read_newline_sep(argv[i + 1]);
+				i ++;
+			} else if (strcmp(argv[i], "--filesum-path") == 0) {
+				g_filesum_whitelist = config_read_var_whitelist(argv[i + 1]);
+				i ++;
+			}
+		}
+	}
+	// if one of the paths wasn't found in args, read from default file path
+	if (g_sar_sum_whitelist == NULL) g_sar_sum_whitelist = config_read_newline_sep(SAR_WHITELIST_FILE);
+	if (g_filesum_whitelist == NULL) g_filesum_whitelist = config_read_var_whitelist(FILESUM_WHITELIST_FILE);
 
 	g_config.file_sum_mode = 2;
 	g_config.initial_cvar_mode = 2;
@@ -309,6 +323,11 @@ int main(int argc, char **argv) {
 	if (argc >= 2) {
 		printf("\n{\n\t\"demos\": [\n");
 		for (int i = 1; i < argc; i ++) {
+			if (strncmp(argv[i], "--", 2) == 0) {
+				i ++;
+				continue;
+			}
+
 			char *path = argv[i];
 			if (i > 1) printf(",\n");
 			run_demo(path);

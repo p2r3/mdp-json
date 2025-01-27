@@ -29,6 +29,7 @@ static inline void _sar_data_free(struct sar_data data) {
 		free(data.initial_cvar.val);
 		break;
 
+	case SAR_DATA_ENTITY_INPUT_SLOT:
 	case SAR_DATA_ENTITY_INPUT:
 		free(data.entity_input.targetname);
 		free(data.entity_input.classname);
@@ -52,7 +53,12 @@ static inline void _sar_data_free(struct sar_data data) {
 			free(data.speedrun_time.splits[i].name);
 			free(data.speedrun_time.splits[i].segs);
 		}
+		for (size_t i = 0; i < data.speedrun_time.nrules; ++i) {
+			free(data.speedrun_time.rules[i].name);
+			free(data.speedrun_time.rules[i].data);
+		}
 		free(data.speedrun_time.splits);
+		if (data.speedrun_time.rules) free(data.speedrun_time.rules);
 		break;
 
 	case SAR_DATA_FILE_CHECKSUM:
@@ -83,6 +89,10 @@ static inline void _msg_free(struct demo_msg *msg) {
 
 void demo_free(struct demo *demo) {
 	if (!demo) return;
+	free(demo->hdr.server_name);
+	free(demo->hdr.client_name);
+	free(demo->hdr.map_name);
+	free(demo->hdr.game_directory);
 	for (size_t i = 0; i < demo->nmsgs; ++i) {
 		_msg_free(demo->msgs[i]);
 	}
@@ -212,12 +222,13 @@ static int _parse_sar_data(struct sar_data *out, FILE *f, size_t len) {
 		break;
 
 	case SAR_DATA_PAUSE:
-		if (len != 5) {
+		if (len < 5 || len > 6) {
 			out->type = SAR_DATA_INVALID;
 			break;
 		}
 
-		out->pause_ticks = _read_u32(data);
+		out->pause_time.ticks = _read_u32(data);
+		out->pause_time.timed = len == 6 ? data[4] : -1;
 		break;
 
 	case SAR_DATA_WAIT_RUN:
@@ -292,7 +303,43 @@ static int _parse_sar_data(struct sar_data *out, FILE *f, size_t len) {
 			}
 		}
 
-		if (data != data_orig + len - 1) out->type = SAR_DATA_INVALID;
+		out->speedrun_time.nrules = 0;
+		out->speedrun_time.rules = NULL;
+
+		if (data > data_orig + len - 1) {
+			out->type = SAR_DATA_INVALID;
+			break;
+		}
+
+		if (data == data_orig + len - 1) {
+			break;
+		}
+
+		size_t rule_ver = _read_u32(data);
+		data += 4;
+		switch (rule_ver) {
+			case 1:
+				out->speedrun_time.nrules = _read_u32(data);
+				data += 4;
+
+				out->speedrun_time.rules = malloc(out->speedrun_time.nrules * sizeof out->speedrun_time.rules[0]);
+
+				for (size_t i = 0; i < out->speedrun_time.nrules; ++i) {
+					out->speedrun_time.rules[i].name = strdup((char *)data);
+					data += strlen(out->speedrun_time.rules[i].name) + 1;
+
+					out->speedrun_time.rules[i].data = strdup((char *)data);
+					data += strlen(out->speedrun_time.rules[i].data) + 1;
+				}
+				break;
+			default:
+				out->type = SAR_DATA_INVALID;
+				break;
+		}
+
+		if (data != data_orig + len - 1) {
+			out->type = SAR_DATA_INVALID;
+		}
 
 		break;
 
@@ -319,6 +366,11 @@ static int _parse_sar_data(struct sar_data *out, FILE *f, size_t len) {
 
 		out->file_checksum.sum = _read_u32(data);
 		out->file_checksum.path = strdup((char *)(data + 4));
+
+		break;
+
+	case SAR_DATA_QUEUEDCMD:
+		out->queuedcmd = strdup((char *)data);
 
 		break;
 
@@ -644,6 +696,7 @@ struct demo *demo_parse(const char *path) {
 	demo->msgs = msgs;
 	demo->checksum = checksum;
 	demo->v2sum_state = v2sum_present ? (v2sum_valid ? V2SUM_VALID : V2SUM_INVALID) : V2SUM_NONE;
+	demo->tickrate = (float)hdr.playback_ticks / hdr.playback_time;
 
 	return demo;
 }

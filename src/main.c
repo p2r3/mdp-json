@@ -26,6 +26,8 @@ struct {
 	int initial_cvar_mode; // 0 = don't show, 1 = show not matching, 2 (default) = show not matching or not present
 	bool show_passing_checksums; // should we output successful checksums?
 	bool show_wait; // should we show when 'wait' was run?
+	bool show_splits; // should we show split times?
+	int show_netmessages; // 0 = don't show, 1 = show all except srtimer, 2 = show all
 } g_config;
 
 static bool _allow_initial_cvar(const char *var, const char *val) {
@@ -72,7 +74,7 @@ static bool _ignore_filesum(const char *path) {
 static const char *const _g_map_found = "_MAP_FOUND";
 static const char **_g_expected_maps;
 
-static void _output_sar_data(uint32_t tick, struct sar_data data) {
+static void _output_sar_data(struct demo *demo, uint32_t tick, struct sar_data data) {
 	switch (data.type) {
 	case SAR_DATA_TIMESCALE_CHEAT:
 		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"timescale\", \"value\": \"%.2f\" },\n", tick, data.timescale);
@@ -84,12 +86,12 @@ static void _output_sar_data(uint32_t tick, struct sar_data data) {
 				for (size_t i = 0; i < strlen(data.initial_cvar.val); ++i) {
 					if (data.initial_cvar.val[i] == '"') data.initial_cvar.val[i] = '\'';
 				}
-				printf("\t\t\t\t{ \"tick\": %d, \"type\": \"cvar\", \"val\": { \"cvar\": \"%s\", \"val\": \"%s\" } },\n", tick, data.initial_cvar.cvar, data.initial_cvar.val);
+				printf("\t\t\t\t{ \"tick\": %d, \"type\": \"cvar\", \"value\": { \"cvar\": \"%s\", \"value\": \"%s\" } },\n", tick, data.initial_cvar.cvar, data.initial_cvar.val);
 			}
 		}
 		break;
 	case SAR_DATA_PAUSE:
-		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"pause\", \"value\": %d },\n", tick, data.pause_ticks);
+		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"pause\", \"value\": { \"ticks\": %d, \"timed\": %s } },\n", tick, data.pause_time.ticks, data.pause_time.timed == -1 ? "null" : (data.pause_time.timed ? "true" : "false"));
 		break;
 	case SAR_DATA_INVALID:
 		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"invalid\" },\n", tick);
@@ -107,8 +109,8 @@ static void _output_sar_data(uint32_t tick, struct sar_data data) {
 		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"frametime\", \"value\": %f },\n", tick, data.frametime * 1000.0f);
 		break;
 	case SAR_DATA_SPEEDRUN_TIME:
-		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"speedrun\", \"value\":\n\t\t\t\t\t{\n\t\t\t\t\t\t\"splits\": [\n", tick);
-		{
+		if (g_config.show_splits) {
+			printf("\t\t\t\t{ \"tick\": %d, \"type\": \"speedrun\", \"value\":\n\t\t\t\t\t{\n\t\t\t\t\t\t\"splits\": [\n", tick);
 			size_t ticks = 0;
 			for (size_t i = 0; i < data.speedrun_time.nsplits; ++i) {
 				printf("\t\t\t\t\t\t\t{ \"name\": \"%s\", \"segments\":\n\t\t\t\t\t\t\t\t[\n", data.speedrun_time.splits[i].name);
@@ -122,9 +124,16 @@ static void _output_sar_data(uint32_t tick, struct sar_data data) {
 				if (i != data.speedrun_time.nsplits - 1) printf(",");
 				printf("\n");
 			}
+			printf("\t\t\t\t\t\t],\n\t\t\t\t\t\t\"rules\": [\n");
+			for (size_t i = 0; i < data.speedrun_time.nrules; ++i) {
+				for (size_t j = 0; j < strlen(data.speedrun_time.rules[i].data); ++j) {
+					if (data.speedrun_time.rules[i].data[j] == '"') data.speedrun_time.rules[i].data[j] = '\'';
+				}
+				printf("\t\t\t\t\t\t\t{ \"name\": \"%s\", \"data\": \"%s\" },\n", data.speedrun_time.rules[i].name, data.speedrun_time.rules[i].data);
+			}
 			printf("\t\t\t\t\t\t],\n");
 
-			size_t total = roundf((float)(ticks * 1000) / 60.0f);
+			size_t total = roundf((float)(ticks * 1000) / demo->tickrate);
 
 			int ms = total % 1000;
 			total /= 1000;
@@ -162,24 +171,189 @@ static void _output_sar_data(uint32_t tick, struct sar_data data) {
 	case SAR_DATA_PORTAL_PLACEMENT:
 		printf("\t\t\t\t{ \"tick\": %d, \"type\": \"portal\", \"value\": %d },\n", tick, data.portal_placement.orange);
 		break;
+	case SAR_DATA_QUEUEDCMD:
+		if (!config_check_cmd_whitelist(g_cmd_whitelist, data.queuedcmd)) {
+			for (size_t i = 0; i < strlen(data.queuedcmd); ++i) {
+				if (data.queuedcmd[i] == '"') data.queuedcmd[i] = '\'';
+			}
+			printf("\t\t\t\t{ \"tick\": %d, \"type\": \"queuedcmd\", \"value\": \"%s\" },\n", tick, data.queuedcmd);
+		}
+		break;
 	default:
 		// don't care
 		break;
 	}
 }
 
-static void _output_msg(struct demo_msg *msg) {
+#define SAR_MSG_INIT_B "&^!$"
+#define SAR_MSG_INIT_O "&^!%"
+#define SAR_MSG_CONT_B "&^?$"
+#define SAR_MSG_CONT_O "&^?%"
+
+static char g_partial[8192];
+static int g_expected_len = 0;
+
+///// START BASE92 /////
+
+// This isn't really base92. Instead, we encode 4-byte input chunks into 5 base92 characters. If the
+// final chunk is not 4 bytes, each byte of it is sent as 2 base92 characters; the receiver infers
+// this from the buffer length and decodes accordingly. This system is almost as space-efficient as
+// is possible.
+
+static char base92_chars[93] = // 93 because null terminator
+	"abcdefghijklmnopqrstuvwxyz"
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	"0123456789"
+	"!$%^&*-_=+()[]{}<>'@#~;:/?,.|\\";
+
+// doing this at runtime is a little silly but shh
+static const char *base92_reverse() {
+	static char map[256];
+	static int initd = 0;
+	if (initd == 0) {
+		initd = 1;
+		for (int i = 0; i < 92; ++i) {
+			char c = base92_chars[i];
+			map[(int)c] = i;
+		}
+	}
+	return map;
+}
+
+static char *base92_decode(const char *encoded, int len) {
+	const char *base92_rev = base92_reverse();
+
+	static char out[512]; // leave some overhead lol
+	static int outLen;
+	memset(out, 0, sizeof(out));
+	outLen = 0;
+	#define push(val) \
+		out[outLen++] = val;
+	while (len > 6 || len == 5) {
+		unsigned val = base92_rev[(unsigned)encoded[4]];
+		val = (val * 92) + base92_rev[(unsigned)encoded[3]];
+		val = (val * 92) + base92_rev[(unsigned)encoded[2]];
+		val = (val * 92) + base92_rev[(unsigned)encoded[1]];
+		val = (val * 92) + base92_rev[(unsigned)encoded[0]];
+
+		char *raw = (char *)&val;
+		push(raw[0]);
+		push(raw[1]);
+		push(raw[2]);
+		push(raw[3]);
+
+		encoded += 5;
+		len -= 5;
+	}
+	while (len > 0) {
+		unsigned val = base92_rev[(unsigned)encoded[1]];
+		val = (val * 92) + base92_rev[(unsigned)encoded[0]];
+
+		char *raw = (char *)&val;
+		push(raw[0]);
+		encoded += 2;
+		len -= 2;
+	}
+	return out;
+}
+
+///// END BASE92 /////
+
+static bool handleMessage(struct demo_msg *msg) {
+	if (strncmp(msg->con_cmd, "say \"", 5)) return false;
+	if (strlen(msg->con_cmd) < 10) return false;
+	bool has_prefix = true;
+	char *prefix = msg->con_cmd + 5;
+	bool cont, orange;
+	if (!strncmp(prefix, SAR_MSG_INIT_B, 4)) {
+		cont = false;
+		orange = false;
+	} else if (!strncmp(prefix, SAR_MSG_INIT_O, 4)) {
+		cont = false;
+		orange = true;
+	} else if (!strncmp(prefix, SAR_MSG_CONT_B, 4)) {
+		cont = true;
+		orange = false;
+	} else if (!strncmp(prefix, SAR_MSG_CONT_O, 4)) {
+		cont = true;
+		orange = true;
+	} else {
+		has_prefix = false;
+	}
+
+	if (!has_prefix) return false;
+
+	if (cont) {
+		if (!g_expected_len) {
+			// fprintf(g_errfile, "\t\t[%5u] Unmatched NetMessage continuation %s\n", msg->tick, msg->con_cmd);
+			return false;
+		}
+		strcat(g_partial, msg->con_cmd + 9);
+	} else {
+		char *raw = base92_decode(msg->con_cmd + 9, 5);
+		g_expected_len = (int)*raw;
+		strcat(g_partial, msg->con_cmd + 14);
+	}
+
+	if (strlen(g_partial) < g_expected_len) {
+		// fprintf(g_outfile, "\t\t[%5u] NetMessage continuation %d != %d\n", msg->tick, g_expected_len, (int)strlen(g_partial));
+		return true;
+	} else if (strlen(g_partial) > g_expected_len) {
+		// fprintf(g_errfile, "\t\t[%5u] NetMessage length mismatch %d != %d\n", msg->tick, g_expected_len, (int)strlen(g_partial));
+		return false;
+	} else {
+		char *decoded = base92_decode(g_partial, g_expected_len);
+		char *type = decoded;
+		char *data = decoded + strlen(type) + 1;
+
+		if (g_config.show_netmessages == 2 || (g_config.show_netmessages == 1 && strcmp(type, "srtimer"))) {
+			printf("\t\t\t\t{ \"tick\": %d, \"type\": \"netmessage\", \"value\": { \"player\": \"%s\", \"type\": \"%s\"", msg->tick, orange ? "o" : "b", type);
+
+			// print data
+			int datalen = strlen(data);
+			bool printdata = true;
+			if (!strcmp(type, "srtimer")) {
+				datalen = 4;
+				printdata = false;
+			}
+			if (!strcmp(type, "cmboard")) {
+				datalen = 0;
+			}
+
+			if (datalen > 0) {
+				if (printdata) printf(", \"data\": \"%s\", \"hex\": \"", data);
+				else printf(", \"data\": null, \"hex\": \"");
+
+				for (int i = 0; i < datalen; ++i) {
+					printf("%02X", (unsigned char)data[i]);
+				}
+				printf("\"");
+			} else {
+				printf(", \"data\": null, \"hex\": null");
+			}
+
+			printf(" } },\n");
+		}
+	}
+	g_expected_len = 0;
+	g_partial[0] = 0;
+	return true;
+}
+
+static void _output_msg(struct demo *demo, struct demo_msg *msg) {
 	switch (msg->type) {
 	case DEMO_MSG_CONSOLE_CMD:
 		if (!config_check_cmd_whitelist(g_cmd_whitelist, msg->con_cmd)) {
-			for (size_t i = 0; i < strlen(msg->con_cmd); ++i) {
-				if (msg->con_cmd[i] == '"') msg->con_cmd[i] = '\'';
+			if (!handleMessage(msg)) {
+				for (size_t i = 0; i < strlen(msg->con_cmd); ++i) {
+					if (msg->con_cmd[i] == '"') msg->con_cmd[i] = '\'';
+				}
+				printf("\t\t\t\t{ \"tick\": %d, \"type\": \"cmd\", \"value\": \"%s\" },\n", msg->tick, msg->con_cmd);
 			}
-			printf("\t\t\t\t{ \"tick\": %d, \"type\": \"cmd\", \"value\": \"%s\" },\n", msg->tick, msg->con_cmd);
 		}
 		break;
 	case DEMO_MSG_SAR_DATA:
-		_output_sar_data(msg->tick, msg->sar_data);
+		_output_sar_data(demo, msg->tick, msg->sar_data);
 		break;
 	default:
 		break;
@@ -211,7 +385,7 @@ void run_demo(const char *path) {
 	printf("\t\t\t\"file\": \"%s\",\n", path);
 	printf("\t\t\t\"user\": \"%s\",\n", demo->hdr.client_name);
 	printf("\t\t\t\"map\": \"%s\",\n", demo->hdr.map_name);
-	printf("\t\t\t\"tps\": %.2f,\n", (float)demo->hdr.playback_ticks / demo->hdr.playback_time);
+	printf("\t\t\t\"tps\": %.2f,\n", demo->tickrate);
 	printf("\t\t\t\"ticks\": %d,\n", demo->hdr.playback_ticks);
 	printf("\t\t\t\"events\": [\n");
 	for (size_t i = 0; i < demo->nmsgs; ++i) {
@@ -222,7 +396,7 @@ void run_demo(const char *path) {
 			has_csum = true;
 		} else {
 			// normal message
-			_output_msg(msg);
+			_output_msg(demo, msg);
 		}
 	}
 
@@ -284,6 +458,8 @@ int main(int argc, char **argv) {
 	g_config.initial_cvar_mode = 2;
 	g_config.show_passing_checksums = false;
 	g_config.show_wait = true;
+	g_config.show_splits = true;
+	g_config.show_netmessages = 2;
 	struct var_whitelist *general_conf = config_read_var_whitelist(GENERAL_CONF_FILE);
 	if (general_conf) {
 		for (struct var_whitelist *ptr = general_conf; ptr->var_name; ++ptr) {
@@ -312,6 +488,20 @@ int main(int argc, char **argv) {
 			if (!strcmp(ptr->var_name, "show_wait")) {
 				int val = atoi(ptr->val);
 				g_config.show_wait = val != 0;
+				continue;
+			}
+
+			if (!strcmp(ptr->var_name, "show_splits")) {
+				int val = atoi(ptr->val);
+				g_config.show_splits = val != 0;
+				continue;
+			}
+
+			if (!strcmp(ptr->var_name, "show_netmessages")) {
+				int val = atoi(ptr->val);
+				if (val < 0) val = 0;
+				if (val > 2) val = 2;
+				g_config.show_netmessages = val;
 				continue;
 			}
 

@@ -31,6 +31,7 @@ struct sar_data {
 		SAR_DATA_HWAIT_RUN = 0x0D,
 		SAR_DATA_ENTITY_SERIAL = 0x0E,
 		SAR_DATA_FRAMETIME = 0x0F,
+		SAR_DATA_QUEUEDCMD = 0x10,
 		SAR_DATA_CHECKSUM = 0xFF,
 		SAR_DATA_CHECKSUM_V2 = 0xFE,
 
@@ -41,8 +42,13 @@ struct sar_data {
 
 	union {
 		float timescale;
-		uint32_t pause_ticks;
 		float frametime;
+		char *queuedcmd;
+
+		struct {
+			uint32_t ticks;
+			int timed;
+		} pause_time;
 
 		struct {
 			char *cvar;
@@ -96,6 +102,11 @@ struct sar_data {
 					int ticks;
 				} *segs;
 			} *splits;
+			size_t nrules;
+			struct {
+				char *name;
+				char *data;
+			} *rules;
 		} speedrun_time;
 
 		struct {
@@ -146,6 +157,7 @@ struct demo {
 	size_t nmsgs;
 	struct demo_msg **msgs;
 	uint32_t checksum;
+	float tickrate;
 	enum {
 		V2SUM_NONE,
 		V2SUM_INVALID,

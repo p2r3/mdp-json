@@ -129,7 +129,9 @@ static void _output_sar_data(struct demo *demo, uint32_t tick, struct sar_data d
 				for (size_t j = 0; j < strlen(data.speedrun_time.rules[i].data); ++j) {
 					if (data.speedrun_time.rules[i].data[j] == '"') data.speedrun_time.rules[i].data[j] = '\'';
 				}
-				printf("\t\t\t\t\t\t\t{ \"name\": \"%s\", \"data\": \"%s\" },\n", data.speedrun_time.rules[i].name, data.speedrun_time.rules[i].data);
+				printf("\t\t\t\t\t\t\t{ \"name\": \"%s\", \"data\": \"%s\" }", data.speedrun_time.rules[i].name, data.speedrun_time.rules[i].data);
+				if (i != data.speedrun_time.nrules - 1) printf(",");
+				printf("\n");
 			}
 			printf("\t\t\t\t\t\t],\n");
 
